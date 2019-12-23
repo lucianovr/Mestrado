@@ -1,0 +1,373 @@
+#!/usr/bin/env python
+from __future__ import print_function
+import rospy
+import cv2
+import numpy as np
+import sys
+
+from plt_msgs.msg import Line
+from plt_msgs.msg import Lines
+from plt_msgs.msg import UavError
+
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
+
+from nav_msgs.msg import Odometry  # for uav position callback
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+
+from plt_cv.utils import *
+
+RHO_MIN = 10
+THETA_MAX = (5.0*np.pi/180.0)
+THETA_TEMPORAL_ERROR = (10.0*np.pi/180.0)
+
+
+class LineTracking:
+    def __init__(self):
+        self.init_params()
+        self.init_topics()
+        self.init_publishers()
+        self.init_subscribers()
+
+        # Power lines for tracking
+        self.line_left = None
+        self.line_middle = None
+        self.line_right = None
+        self.last_dist = None
+
+        self.frame = None
+        self.bridge = CvBridge()
+        self.hasImg = 0
+
+        self.pose = None
+
+        self.font = cv2.FONT_HERSHEY_SIMPLEX
+
+    def init_params(self):
+        # debug params
+        self.DEBUG_IMAGES = (bool)(rospy.get_param('~show_images', True))
+        self.move_window = True
+        self.cables_max_dist = (int)(rospy.get_param('~cables_max_dist'))
+
+        self.image_H = (int)(rospy.get_param("image_H"))
+        self.image_W = (int)(rospy.get_param("image_W"))
+
+        # line detector params
+        print("cables_max_dist = %d\nimage_H = %d\nimage_W = %d\n" %
+              (self.cables_max_dist, self.image_H, self.image_W))
+
+    # hardcoded topics
+    def init_topics(self):
+        # subscriber topics
+        self.lines_topic = "/plt_cv/lines"
+        self.img_topic = "/cgo3_camera/image_raw"
+        self.position_topic = "/mavros/global_position/local"
+
+        # publisher topics
+        self.error_topic = "/uav/error"
+        self.detected_line_topic = "/uav/line"
+
+    def init_subscribers(self):
+        rospy.Subscriber(self.lines_topic, Lines, self.linesCb, queue_size=1)
+        rospy.Subscriber(self.position_topic, Odometry,
+                         self.poseCb, queue_size=1)
+
+        if self.DEBUG_IMAGES:
+            rospy.Subscriber(self.img_topic, Image,
+                             self.imagesCb, queue_size=1)
+
+    def init_publishers(self):
+        self.error_pub = rospy.Publisher(
+            self.error_topic, UavError, queue_size=1)
+
+        self.line_pub = rospy.Publisher(
+            self.detected_line_topic, UavError, queue_size=1)
+
+    # callback of image frame
+
+    def poseCb(self, data):
+        x = data.pose.pose.position.x
+        y = data.pose.pose.position.y
+        z = data.pose.pose.position.z
+
+        orientation_q = data.pose.pose.orientation
+        orientation_list = [orientation_q.x,
+                            orientation_q.y, orientation_q.z, orientation_q.w]
+        (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+
+        self.pose = (x, y, z, roll, pitch, yaw)
+
+    def imagesCb(self, image):
+        try:
+            self.frame = self.bridge.imgmsg_to_cv2(image, "bgr8")
+            self.hasImg = 1
+        except CvBridgeError as e:
+            print(e)
+
+    def debug(self, COR_LEFT=GREEN, COR_MID=GREEN, COR_RIGHT=GREEN):
+        if self.DEBUG_IMAGES == False or self.hasImg == 0:
+            return
+
+        H, W, D = self.frame.shape
+        pt1 = (W/2, H/2)
+
+        left = get_head(pt1, self.line_left.rho, self.line_left.theta)
+        cv2.circle(self.frame, left, 3, COR_LEFT, 2)
+
+        mid = get_head(pt1, self.line_middle.rho, self.line_middle.theta)
+        cv2.circle(self.frame, mid, 3, COR_MID, 2)
+
+        right = get_head(pt1, self.line_right.rho, self.line_right.theta)
+        cv2.circle(self.frame, right, 3, COR_RIGHT, 2)
+
+        cv2.circle(self.frame, pt1, 2, BLUE, 2)
+
+        cv2.line(self.frame, pt1, mid, BLUE, 1)
+        if self.line_middle != None and self.last_dist != None:
+            dist = ((self.line_middle.rho) / self.last_dist) * \
+                self.cables_max_dist
+            dist = float(int(dist * 10.0))/10.0
+            cv2.putText(self.frame, str(dist)+"m",
+                        (pt1[0], pt1[1]+25), self.font, 0.6, BLUE, 2)
+
+        if self.line_middle != None:
+            yaw = self.line_middle.theta
+            yaw = rad2deg(yaw)
+            yaw = float(int(yaw * 10.0))/10.0
+            cv2.putText(self.frame, str(yaw),
+                        (mid[0], mid[1]-50), self.font, 0.6, RED, 2)
+
+        cv2.imshow("tracking", self.frame)
+        if self.move_window == True:
+            self.move_window = False
+            cv2.moveWindow("tracking", 100, 1*self.image_H + 175)
+        cv2.waitKey(1)
+
+    # based in a paper, this will translate the parameters (rho, theta) of Hough Transform
+    # rho will be counted from the center of the image and not more from the top left corner
+    # vertical lines will have theta equals to 0 and its range will be [-pi, pi].
+
+    def change_origin_rho_theta(self, line, img_H, img_W):
+        line.rho = line.rho - (img_W*np.cos(line.theta) +
+                               img_H*np.sin(line.theta)) / 2.0
+        if(line.theta > np.pi/2.0):
+            line.theta = line.theta - np.pi
+            line.rho = -line.rho
+        return line
+
+    # Used to sort the power lines
+
+    def bubble_sort(self, lista):
+        elementos = len(lista)-1
+        ordenado = False
+        while not ordenado:
+            ordenado = True
+            for i in xrange(0, elementos):
+                if lista[i].rho > lista[i+1].rho:
+                    lista[i], lista[i+1] = lista[i+1], lista[i]
+                    ordenado = False
+        return lista
+
+    def get_best_lines(self, lines, n=3, last_theta=None):
+        ''' Returns the best N lines from Hough Space in a way that all N lines are parallel to
+        to each other and not coincident '''
+        best = []
+        x = len(lines)
+        for i in range(x):
+            ok = 1
+
+            # The orientation of the current line should not be too much different from the
+            # best lines from past images
+            if(last_theta != None):
+                error = abs(lines[i].theta - last_theta)
+                if(False == (error < THETA_TEMPORAL_ERROR)):
+                    ok = 0
+
+            if(ok):
+                for line in best:
+                    # After choosing the first line, the others must have a minial distance to
+                    # all pre-selected (RHO_MIN) and not differ much regarding to the orientation (THETA_MAX)
+                    if(False == (abs(line.rho - lines[i].rho) > RHO_MIN and abs(line.theta - lines[i].theta) < THETA_MAX)):
+                        ok = 0
+                        break
+
+            if(ok):
+                best.append(lines[i])
+
+            if(len(best) == n):
+                break
+        # return the sorted list of lines
+        return self.bubble_sort(best)
+
+    def near(self, line):
+        '''Returns the line more closer to this parameter'''
+        match = "LEFT"
+        min_dist = abs(self.line_left.rho - line.rho)
+        tmp = abs(line.rho - self.line_middle.rho)
+        if (tmp < min_dist):
+            min_dist = tmp
+            match = "MIDDLE"
+        tmp = abs(line.rho - self.line_right.rho)
+        if tmp < min_dist:
+            min_dist = tmp
+            match = "RIGHT"
+
+        return match
+
+    # If the image processing only return one line, wich one it is? the Left, Middle or Right
+    # Find that we can estimate the position of the other lines
+
+    def find_one_match(self, line):
+        if self.line_left == None or self.line_middle == None or self.line_right == None or self.last_dist == None:
+            return None
+
+        match = self.near(line)
+
+        if match == "LEFT":
+            self.line_left = line
+            self.line_middle.theta = self.line_left.theta
+            self.line_right.theta = self.line_left.theta
+            self.line_middle.rho = self.line_left.rho + self.last_dist / 2.0
+            self.line_right.rho = self.line_left.rho + self.last_dist
+
+        elif match == "MIDDLE":
+            self.line_middle = line
+            self.line_left.theta = self.line_middle.theta
+            self.line_right.theta = self.line_middle.theta
+            self.line_left.rho = self.line_middle.rho - self.last_dist / 2.0
+            self.line_right.rho = self.line_middle.rho + self.last_dist / 2.0
+
+        elif match == "RIGHT":
+            self.line_right = line
+            self.line_left.theta = self.line_right.theta
+            self.line_middle.theta = self.line_right.theta
+            self.line_left.rho = self.line_right.rho - self.last_dist
+            self.line_middle.rho = self.line_right.rho - self.last_dist/2.0
+
+        self.last_dist = abs(self.line_left.rho - self.line_right.rho)
+        return match
+
+    # If the image processing only return two lines, wich one is missing? the Left, Middle or Right?
+    # We will find the correspondent of linEsq and linDir with the others, self.line_left...
+    # and estimate the position of the missing one
+    def find_missing(self, lineEsq, lineDir):
+        if self.line_left == None or self.line_middle == None or self.line_right == None or self.last_dist == None:
+            return None
+
+        '''Give two identified lines, find and fill the another that completes the 3 power lines'''
+        esquerda = self.near(lineEsq)
+        direita = self.near(lineDir)
+
+        missing = None
+
+        if esquerda == "LEFT":
+            self.line_left = lineEsq
+            if direita == "MIDDLE":
+                missing = "RIGHT"
+                self.line_middle = lineDir
+                self.line_right.theta = self.line_middle.theta
+                self.line_right.rho = self.line_middle.rho + \
+                    (self.line_middle.rho - self.line_left.rho)
+            elif direita == "RIGHT":
+                missing = "MIDDLE"
+                self.line_right = lineDir
+                self.line_middle.theta = self.line_right.theta
+                self.line_middle.rho = (
+                    self.line_left.rho + self.line_right.rho)/2.0
+        elif esquerda == "MIDDLE":
+            self.line_middle = lineEsq
+            if direita == "RIGHT":
+                missing = "LEFT"
+                self.line_right = lineDir
+                self.line_left.theta = self.line_right.theta
+                self.line_left.rho = self.line_middle.rho - \
+                    (self.line_right.rho - self.line_middle.rho)
+
+        self.last_dist = abs(self.line_left.rho - self.line_right.rho)
+        return missing
+
+    # callback of lines
+
+    def linesCb(self, msg):
+        ''' Process msg that contains the power lines. First convert the origin of images to
+        the central of the image (the rho starts counting from the oringin instead of the
+        top left corner) '''
+
+        should_publish = True
+        lines = msg.lines
+        for i in range(len(lines)):
+            lines[i] = self.change_origin_rho_theta(
+                lines[i], self.image_H, self.image_W)
+
+        # Get the best lines based in the hough transform votes and their parallelism, also
+        # the limes come sorted
+
+        if (self.line_middle != None):
+            best = self.get_best_lines(lines, 3, self.line_middle.theta)
+        else:
+            best = self.get_best_lines(lines, 3)
+
+        # All lines were detected
+        if len(best) == 3:
+            self.line_left, self.line_middle, self.line_right = best
+            self.last_dist = abs(self.line_right.rho - self.line_left.rho)
+            self.debug()
+
+        # Just two lines were detect, must calculate the another
+        elif len(best) == 2:
+            missing = self.find_missing(best[0], best[1])
+            if missing == "LEFT":
+                self.debug(COR_LEFT=RED)  # collour with red the missing line
+            elif missing == "MIDDLE":
+                self.debug(COR_MID=RED)
+            elif missing == "RIGHT":
+                self.debug(COR_RIGHT=RED)
+
+        # Just one line was found, find the others
+        elif len(best) == 1:
+            match = self.find_one_match(best[0])
+            if match == "LEFT":
+                # collour with red the missing lines
+                self.debug(COR_MID=RED, COR_RIGHT=RED)
+            elif match == "MIDDLE":
+                self.debug(COR_LEFT=RED, COR_RIGHT=RED)
+            elif match == "RIGHT":
+                self.debug(COR_LEFT=RED, COR_MID=RED)
+        else:
+            self.debug(COR_LEFT=RED, COR_MID=RED, COR_RIGHT=RED)
+            should_publish = False
+
+        if should_publish == True and self.line_middle != None and self.last_dist != None:
+            
+            uav_pose_calculed = UavError()
+            uav_pose_calculed.header.stamp = rospy.Time.now()
+            uav_pose_calculed.distance = ((self.line_middle.rho) /
+                                 self.last_dist) * self.cables_max_dist
+            uav_pose_calculed.theta = rad2deg( self.line_middle.theta )
+            uav_pose_calculed.lines_found = len(best)
+
+            self.line_pub.publish( uav_pose_calculed )
+
+            uav_pose_error = UavError()
+            uav_pose_error.header.stamp = rospy.Time.now()
+            uav_pose_error.distance = self.pose[1] - uav_pose_calculed.distance
+            uav_pose_error.theta = rad2deg(self.pose[5]) - uav_pose_calculed.theta
+            uav_pose_calculed.lines_found = uav_pose_calculed.lines_found
+            
+            self.error_pub.publish( uav_pose_error )
+
+
+def main(args):
+    rospy.init_node('line_tracking_node')
+
+    line_tracking_node = LineTracking()
+
+    try:
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        print("Shutting down")
+    cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    main(sys.argv)

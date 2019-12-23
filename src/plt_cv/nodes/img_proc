@@ -1,0 +1,120 @@
+#!/usr/bin/env python
+from __future__ import print_function
+
+import rospy
+import cv2
+import numpy as np
+import sys
+
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge, CvBridgeError
+
+from plt_cv.edge import Edge
+from plt_cv.line_detector import LineDetector
+from plt_cv.filter_noise import FilterNoise
+from plt_cv.utils import *
+
+from plt_msgs.msg import Line
+from plt_msgs.msg import Lines
+
+
+class image_proc:
+    def __init__(self):
+        self.init_params()
+        self.init_topics()
+        self.init_publishers()
+        self.bridge = CvBridge()
+        self.init_subscribers()
+
+        self.img_W = 0
+        self.img_H = 0
+
+        self.move_window = True
+
+    def init_params(self):
+        #debug params
+        self.DEBUG_IMAGES = (bool)(rospy.get_param('~show_images'))
+
+        # get parameters to set the correct method to process the images
+        filter_method = rospy.get_param('~filter_method')
+        filter_kernel_sz = (int)(rospy.get_param('~filter_method_kernel_sz'))
+        edge_method = rospy.get_param('~edge_method')
+        lineDetector_method = rospy.get_param('~lineDetector_method')
+        houghTreshold   = rospy.get_param('~hough_treshold')
+
+
+        # set pointers to callback functions that will make the preprocessing step
+        self.filter_method = FilterNoise(filter_method, filter_kernel_sz)
+        self.edge_method = Edge(edge_method)
+        self.lineDetector_method = LineDetector(lineDetector_method, houghTreshold)
+
+
+    def init_topics(self):
+        self.img_topic = "/cgo3_camera/image_raw"
+        self.lines_topic = "/plt_cv/lines"
+
+
+    def init_subscribers(self):
+        self.img_sub = rospy.Subscriber(self.img_topic, Image, self.process)
+
+
+    def init_publishers(self):
+        self.msg_seq = 1
+        self.lines_pub = rospy.Publisher(self.lines_topic, Lines, queue_size=1)
+
+    def process(self, image):
+        try:
+            self.frame = self.bridge.imgmsg_to_cv2(image, "bgr8")
+        except CvBridgeError as e:
+            print(e)
+
+        # Record the image shape
+        self.img_H,self.img_W,_ = self.frame.shape
+        
+        self.gray = cv2.cvtColor(self.frame, cv2.COLOR_BGR2GRAY, 1)
+        self.filtered = self.filter_method.get_img( self.gray )
+        self.edges    = self.edge_method.get_edges( self.filtered )
+        lines         = self.lineDetector_method.get_lines( self.edges )
+        self.publish(lines)
+
+
+    def publish(self, lines):
+        msg = Lines()
+        if lines is not None:
+            msg.header.stamp = rospy.Time.now()
+            msg.header.seq = self.msg_seq
+            msg.lines = set_plt_msgs_Lines(lines)
+            msg.len = len(lines)
+            self.msg_seq = self.msg_seq + 1
+            self.lines_pub.publish(msg)
+
+        if( self.DEBUG_IMAGES ):
+            self.debug_imgs(msg)
+
+    def debug_imgs(self, msg):
+        frame_with_lines = draw_lines(self.frame, msg.lines)
+        cv2.imshow("img", self.frame)
+        cv2.imshow("lines", frame_with_lines)
+        cv2.imshow("edges", self.edges)
+        
+        if self.move_window == True:
+            cv2.moveWindow("img",   150, 50)
+            cv2.moveWindow("edges", 150+1*self.img_W,50)
+            cv2.moveWindow("lines", 150+1*self.img_W, 1*self.img_H + 175)
+            self.move_window = False
+        cv2.waitKey(1)
+
+
+def main(args):
+    rospy.init_node('img_proc_node')
+    img_proc = image_proc()
+    
+    try:
+        rospy.spin()
+    except rospy.ROSInterruptException:
+        print("Shutting down")
+
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main(sys.argv)
